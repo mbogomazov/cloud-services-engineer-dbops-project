@@ -1,0 +1,2 @@
+CREATE INDEX idx_orders_date_created ON orders (date_created);
+CREATE INDEX idx_order_product_order_id ON order_product (order_id);
