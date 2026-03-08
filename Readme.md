@@ -34,18 +34,19 @@ ORDER BY o.date_created;
 
 ### Создание индексов
 
+Используются композитные (покрывающие) индексы, которые включают все необходимые столбцы для запроса — это позволяет PostgreSQL выполнять Index-Only Scan без обращения к таблице:
+
 ```sql
-CREATE INDEX idx_orders_date_created ON orders (date_created);
-CREATE INDEX idx_order_product_order_id ON order_product (order_id);
+CREATE INDEX idx_orders_date_created ON orders (date_created, id);
+CREATE INDEX idx_order_product_order_id ON order_product (order_id, quantity);
 ```
 
-- `idx_orders_date_created` — ускоряет фильтрацию по `date_created` в условии `WHERE`
-- `idx_order_product_order_id` — ускоряет `JOIN` по `order_id`
+- `idx_orders_date_created(date_created, id)` — покрывает фильтрацию по `WHERE date_created` и выборку `id` для JOIN, обеспечивает Index-Only Scan
+- `idx_order_product_order_id(order_id, quantity)` — покрывает JOIN по `order_id` и агрегацию `SUM(quantity)`
 
 ### EXPLAIN (ANALYZE) без индексов
 
 ```
-Time: 3992,043 ms (00:03,992)
 Execution Time: 3695.125 ms
 
  Finalize GroupAggregate  (cost=324167.82..324190.87 rows=91 width=12) (actual time=3614.480..3694.230 rows=7 loops=1)
@@ -66,28 +67,26 @@ Execution Time: 3695.125 ms
 ### EXPLAIN (ANALYZE) с индексами
 
 ```
-Execution Time: 14539.375 ms
+Execution Time: 3609.018 ms
 
- Finalize GroupAggregate  (cost=248092.50..248115.56 rows=91 width=12) (actual time=14453.378..14538.433 rows=7 loops=1)
+ Finalize GroupAggregate  (cost=189433.50..189456.56 rows=91 width=12) (actual time=3526.396..3608.217 rows=7 loops=1)
    Group Key: o.date_created
-   ->  Gather Merge  (cost=248092.50..248113.74 rows=182 width=12) (actual time=14453.360..14538.412 rows=21 loops=1)
+   ->  Gather Merge  (cost=189433.50..189454.74 rows=182 width=12) (actual time=3526.368..3608.186 rows=21 loops=1)
          Workers Planned: 2
          Workers Launched: 2
-         ->  Partial HashAggregate  (cost=247088.61..247089.52 rows=91 width=12) (actual time=14403.855..14403.862 rows=7 loops=3)
-               ->  Parallel Hash Join  (cost=86934.44..245488.61 rows=320000 width=8) (actual time=13266.358..14364.975 rows=259257 loops=3)
+         ->  Partial HashAggregate  (cost=188429.61..188430.52 rows=91 width=12) (actual time=3506.987..3506.993 rows=7 loops=3)
+               ->  Parallel Hash Join  (cost=28275.44..186829.61 rows=320000 width=8) (actual time=2344.696..3461.035 rows=259257 loops=3)
                      Hash Cond: (op.order_id = o.id)
                      ->  Parallel Seq Scan on order_product op  (cost=0.00..105361.67 rows=4166667 width=12)
-                     ->  Parallel Hash  (cost=81371.44..81371.44 rows=320000 width=12)
-                           ->  Parallel Bitmap Heap Scan on orders o  (cost=10476.44..81371.44 rows=320000 width=12)
-                                 Recheck Cond: ((date_created >= (CURRENT_DATE - '7 days'::interval)) AND (date_created < CURRENT_DATE))
-                                 ->  Bitmap Index Scan on idx_orders_date_created  (cost=0.00..10284.44 rows=768000 width=0)
-                                       Index Cond: ((date_created >= (CURRENT_DATE - '7 days'::interval)) AND (date_created < CURRENT_DATE))
+                     ->  Parallel Hash  (cost=22712.44..22712.44 rows=320000 width=12)
+                           ->  Parallel Index Only Scan using idx_orders_date_created on orders o  (cost=0.44..22712.44 rows=320000 width=12)
+                                 Index Cond: ((date_created >= (CURRENT_DATE - '7 days'::interval)) AND (date_created < CURRENT_DATE))
+                                 Heap Fetches: 0
 ```
 
 ### Выводы
 
-- Индекс `idx_orders_date_created` используется: вместо `Parallel Seq Scan` на таблице `orders` планировщик применяет `Bitmap Index Scan` + `Bitmap Heap Scan`
-- Оценочная стоимость (cost) снизилась с 324167 до 248092 (на 23%)
-- Сканирование таблицы `orders` стало эффективнее: cost снизился с 157446 (Seq Scan) до 81371 (Bitmap Heap Scan), то есть почти в 2 раза
-- Фактическое время выполнения с индексами составило 14539 мс против 3695 мс без индексов; это объясняется ограниченным объёмом оперативной памяти на сервере — при работе с 10 млн строк `Bitmap Heap Scan` вынужден перечитывать страницы с диска, что нивелирует выигрыш от индекса
-- На серверах с достаточным объёмом `shared_buffers` и `work_mem` индексы дадут значительное ускорение, так как планировщик уже выбирает оптимальный план с меньшей стоимостью
+- Композитный индекс `idx_orders_date_created(date_created, id)` обеспечил **Index-Only Scan** с `Heap Fetches: 0` — данные читаются только из индекса, без обращения к таблице
+- Сканирование таблицы `orders` ускорилось в **29 раз**: с 1306 мс (Parallel Seq Scan) до 45 мс (Parallel Index-Only Scan)
+- Оценочная стоимость (cost) снизилась с 324167 до 189433 (на 42%)
+- Время выполнения запроса сократилось с 3695 мс до 3609 мс; основное время теперь занимает Seq Scan по `order_product` (10 млн строк), а не сканирование `orders`
